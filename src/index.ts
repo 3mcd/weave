@@ -178,12 +178,21 @@ export class Registry<T> {
 
     while (true) {
       let s = SPARSE_ENTRY_START + (offset % length)
-      let k = this.#sparse[s + SPARSE_OFFSET_KEY]
       await this.#acquire(s)
+      let k = this.#sparse[s + SPARSE_OFFSET_KEY]
 
       if (k === 0) {
         // No entry exists for this key, create it!
-        return this.set(key, value, version)
+        let d = this.#sparse[SPARSE_SIZE]++
+        this.#versions[d] = 1
+        this.#sparse[s] = d
+        this.#sparse[s + SPARSE_OFFSET_KEY] = key
+        this.#sparse[s + SPARSE_OFFSET_LOCK] = 0
+        this.#dense[d * DENSE_ENTRY_SIZE] = s
+        this.#dense[d * DENSE_ENTRY_SIZE + DENSE_OFFSET_VERSION] = 1
+        this.#values[d] = value
+        this.#release(s)
+        return
       }
 
       if (k === key) {
@@ -216,6 +225,7 @@ export class Registry<T> {
       let d: number
 
       await this.#acquire(s)
+
       if (k === key) {
         // update
         d = this.#sparse[s]
