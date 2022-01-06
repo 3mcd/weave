@@ -41,7 +41,7 @@ export class Guarantor<T> {
     return true
   }
 
-  update(t: T) {
+  load(t: T) {
     if (this.#resolve) {
       this.#resolve(t)
     } else {

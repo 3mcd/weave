@@ -29,6 +29,7 @@ describe("Guarantor", () => {
     jest.runAllTimers()
     setTimeout(() => positive.update(0.1), 1)
     jest.runAllTimers()
+    await expect(positive.guarantee()).resolves.toBe(0.1)
     setTimeout(() => positive.update(-1000), 1)
     jest.runAllTimers()
     setTimeout(() => positive.update(10), 1)

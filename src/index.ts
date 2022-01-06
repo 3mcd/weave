@@ -1,42 +1,36 @@
 import "./polyfill"
 import * as Debug from "./debug"
-import * as Signal from "./signal"
 import { Guarantor } from "./guarantor"
+import * as Lock from "./lock"
+import * as Signal from "./signal"
 
-const SUPPORTS_BLOCKING_WAIT =
-  typeof window === "undefined" ||
-  // @ts-expect-error
-  (typeof globalThis.WorkerGlobalScope !== "undefined" &&
-    // @ts-expect-error
-    self instanceof globalThis.WorkerGlobalScope)
-
-type Version = number
-type Sparse<T> = (T | undefined)[]
 type ForEachCallback<T> = (value: T, key: number, registry: Registry<T>) => void
 
 enum MessageType {
-  Share,
-  State,
+  ShareEntry,
+  ShareState,
 }
 
-type ShareMessage = [
-  type: MessageType.Share,
+type State = {
+  state: Uint32Array
+  version: number
+  sparse: Float64Array
+  packed: Float64Array
+  keys: Float64Array
+  versions: Uint32Array
+  locks: Int32Array
+}
+
+type ShareEntryMessage<T> = [
+  type: MessageType.ShareEntry,
   key: number,
-  value: unknown,
+  value: T,
   version: number,
 ]
 
-type StateMessage = [
-  type: MessageType.State,
-  version: number,
-  sparse: Float64Array,
-  packed: Float64Array,
-  keys: Float64Array,
-  versions: Uint32Array,
-  entryLock: Int32Array,
-]
+type ShareStateMessage = [type: MessageType.ShareState, state: State]
 
-type Message = ShareMessage | StateMessage
+type Message<T> = ShareEntryMessage<T> | ShareStateMessage
 
 const STATE_OFFSET_VERSION = 0
 const STATE_OFFSET_SIZE = 1
@@ -51,40 +45,7 @@ function slot(k: number, n: number) {
   return n - (k % n)
 }
 
-async function acquireLockAsync(array: Int32Array, index: number) {
-  let c: number
-  if ((c = Atomics.compareExchange(array, index, 0, 1)) !== 0) {
-    do {
-      if (c === 2 || Atomics.compareExchange(array, index, 1, 2) !== 0)
-        // @ts-expect-error
-        await Atomics.waitAsync(array, index, 2, 100)
-    } while ((c = Atomics.compareExchange(array, index, 0, 2)) !== 0)
-  }
-}
-
-function acquireLockSync(array: Int32Array, index: number) {
-  let c: number
-  if ((c = Atomics.compareExchange(array, index, 0, 1)) !== 0) {
-    do {
-      if (c === 2 || Atomics.compareExchange(array, index, 1, 2) !== 0)
-        Atomics.wait(array, index, 2)
-    } while ((c = Atomics.compareExchange(array, index, 0, 2)) !== 0)
-  }
-}
-
-function acquireLock(array: Int32Array, index = 0): Promise<void> | void {
-  return (SUPPORTS_BLOCKING_WAIT ? acquireLockSync : acquireLockAsync)(array, index)
-}
-
-function releaseLock(array: Int32Array, index = 0) {
-  let v0 = Atomics.sub(array, index, 1)
-  if (v0 !== 1) {
-    Atomics.store(array, index, 0)
-    Atomics.notify(array, index, 1)
-  }
-}
-
-class SharedGuarantor extends Guarantor<Version> {
+class SharedGuarantor extends Guarantor<number> {
   #shared: Uint32Array
   #index: number
 
@@ -94,40 +55,62 @@ class SharedGuarantor extends Guarantor<Version> {
     this.#index = index
   }
 
-  filter(version: Version) {
+  filter(version: number) {
     return version === this.#shared[this.#index]
   }
 
   isInvalid() {
     return this.latest < this.#shared[this.#index]
   }
+
+  increment() {
+    const version = ++this.#shared[this.#index]
+    this.load(version)
+    return version
+  }
 }
 
-function incrementVersion(guarantor: Guarantor<Version>) {
-  guarantor.update(guarantor.latest + 1)
+function makeRegistrySharedArrays(length: number) {
+  let lengthF64 = length * Float64Array.BYTES_PER_ELEMENT
+  let lengthU32 = length * Uint32Array.BYTES_PER_ELEMENT
+  let lengthI32 = length * Int32Array.BYTES_PER_ELEMENT
+  return {
+    sparse: new Float64Array(new SharedArrayBuffer(lengthF64)),
+    packed: new Float64Array(new SharedArrayBuffer(lengthF64)),
+    keys: new Float64Array(new SharedArrayBuffer(lengthF64)),
+    versions: new Uint32Array(new SharedArrayBuffer(lengthU32)),
+    locks: new Int32Array(new SharedArrayBuffer(lengthI32)),
+  }
+}
+
+export function makeShareEntryMessage<T>(
+  key: number,
+  value: T,
+  version: number,
+): ShareEntryMessage<T> {
+  return [MessageType.ShareEntry, key, value, version]
+}
+
+export function makeShareStateMessage(state: State): ShareStateMessage {
+  return [MessageType.ShareState, state]
 }
 
 export class Registry<T> {
-  #lock: Int32Array = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT))
+  #registryLock: Int32Array = new Int32Array(
+    new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+  )
 
   /**
    * `[version, size, length, grow_threshold, grow_target]`
    */
-  #state: Uint32Array = new Uint32Array(
+  #registryState: Uint32Array = new Uint32Array(
     new SharedArrayBuffer(5 * Uint32Array.BYTES_PER_ELEMENT),
   )
 
-  #guarantor = new SharedGuarantor(this.#state, STATE_OFFSET_VERSION)
-
-  /**
-   * Sparse TypedArray that maps keys to their offset in the packed arrays.
-   */
-  #sparse: Float64Array
-
-  /**
-   * Dense TypedArray that maps values to their offset in the sparse arrays.
-   */
-  #packed: Float64Array
+  #registryVersionGuarantor = new SharedGuarantor(
+    this.#registryState,
+    STATE_OFFSET_VERSION,
+  )
 
   /**
    * Sparse TypedArray of keys.
@@ -135,14 +118,24 @@ export class Registry<T> {
   #keys: Float64Array
 
   /**
-   * Sparse TypedArray of entry versions.
-   */
-  #versions: Uint32Array
-
-  /**
    * Sparse TypedArray of entry lock bits.
    */
   #locks: Int32Array
+
+  /**
+   * Dense TypedArray that maps values to their offset in the sparse arrays.
+   */
+  #packed: Float64Array
+
+  /**
+   * Sparse TypedArray that maps keys to their offset in the packed arrays.
+   */
+  #sparse: Float64Array
+
+  /**
+   * Sparse TypedArray of entry versions.
+   */
+  #versions: Uint32Array
 
   /**
    * Dense array of local map values.
@@ -153,104 +146,81 @@ export class Registry<T> {
    * A sparse array of deferred promises to be resolved when their guarantee
    * is executed (upon recieving the latest entry version from another thread).
    */
-  #guarantors: Sparse<SharedGuarantor> = []
+  #entryVersionGuarantors: SharedGuarantor[] = []
 
   #loadFactor: number = 0.7
   #growFactor: number = 2
 
-  onState = Signal.make<StateMessage>()
-  onShare = Signal.make<ShareMessage>()
+  onShareState = Signal.make<ShareStateMessage>()
+  onShareEntry = Signal.make<ShareEntryMessage<T>>()
 
   constructor(length = 1000, loadFactor?: number, growFactor?: number) {
+    const { sparse, packed, keys, versions, locks } = makeRegistrySharedArrays(length)
     this.#loadFactor = loadFactor ?? this.#loadFactor
     this.#growFactor = growFactor ?? this.#growFactor
-    this.#sparse = new Float64Array(
-      new SharedArrayBuffer(length * Float64Array.BYTES_PER_ELEMENT),
-    )
-    this.#packed = new Float64Array(
-      new SharedArrayBuffer(length * Float64Array.BYTES_PER_ELEMENT),
-    )
-    this.#keys = new Float64Array(
-      new SharedArrayBuffer(length * Float64Array.BYTES_PER_ELEMENT),
-    )
-    this.#versions = new Uint32Array(
-      new SharedArrayBuffer(length * Uint32Array.BYTES_PER_ELEMENT),
-    )
-    this.#locks = new Int32Array(
-      new SharedArrayBuffer(length * Int32Array.BYTES_PER_ELEMENT),
-    )
-    this.#state[STATE_OFFSET_LENGTH] = length
-    this.#state[STATE_OFFSET_GROW_THRESHOLD] = length * this.#loadFactor
-    this.#state[STATE_OFFSET_GROW_TARGET] = length + length * this.#growFactor
+    this.#keys = keys
+    this.#locks = locks
+    this.#packed = packed
+    this.#sparse = sparse
+    this.#versions = versions
+    this.#registryState[STATE_OFFSET_LENGTH] = length
+    this.#registryState[STATE_OFFSET_GROW_THRESHOLD] = length * this.#loadFactor
+    this.#registryState[STATE_OFFSET_GROW_TARGET] = length + length * this.#growFactor
   }
 
   async #grow() {
-    let entryLock = this.#locks
-    let packed = this.#packed
-    let keys = this.#keys
-    let values = this.#values
-    let { [STATE_OFFSET_SIZE]: size, [STATE_OFFSET_GROW_TARGET]: length } = this.#state
+    const prevKeys = this.#keys
+    const prevLocks = this.#locks
+    const prevPacked = this.#packed
+    const prevValues = this.#values
+    const { [STATE_OFFSET_SIZE]: size, [STATE_OFFSET_GROW_TARGET]: length } =
+      this.#registryState
+    const { sparse, packed, keys, versions, locks } = makeRegistrySharedArrays(length)
 
-    incrementVersion(this.#guarantor)
+    this.#registryVersionGuarantor.increment()
 
-    this.#sparse = new Float64Array(
-      new SharedArrayBuffer(length * Float64Array.BYTES_PER_ELEMENT),
-    )
-    this.#packed = new Float64Array(
-      new SharedArrayBuffer(length * Float64Array.BYTES_PER_ELEMENT),
-    )
-    this.#keys = new Float64Array(
-      new SharedArrayBuffer(length * Float64Array.BYTES_PER_ELEMENT),
-    )
-    this.#versions = new Uint32Array(
-      new SharedArrayBuffer(length * Uint32Array.BYTES_PER_ELEMENT),
-    )
-    this.#locks = new Int32Array(
-      new SharedArrayBuffer(length * Int32Array.BYTES_PER_ELEMENT),
-    )
-    this.#state[STATE_OFFSET_LENGTH] = length
-    this.#state[STATE_OFFSET_GROW_THRESHOLD] = length * this.#loadFactor
-    this.#state[STATE_OFFSET_GROW_TARGET] = length + length * this.#growFactor
+    this.#keys = keys
+    this.#locks = locks
+    this.#packed = packed
+    this.#sparse = sparse
+    this.#versions = versions
+    this.#registryState[STATE_OFFSET_LENGTH] = length
+    this.#registryState[STATE_OFFSET_GROW_THRESHOLD] = length * this.#loadFactor
+    this.#registryState[STATE_OFFSET_GROW_TARGET] = length + length * this.#growFactor
 
-    for (let p = 0; p < size; p++) {
-      let s = packed[p]
-      await acquireLock(entryLock, s)
-      await this.#set(keys[s], s, values[p])
-      releaseLock(entryLock, s)
+    for (let packedIndex = 0; packedIndex < size; packedIndex++) {
+      let sparseIndex = prevPacked[packedIndex]
+      await this.#acquireEntryLock(sparseIndex)
+      await this.#set(prevKeys[sparseIndex], sparseIndex, prevValues[packedIndex])
+      Lock.releaseLock(prevLocks, sparseIndex)
     }
 
-    Signal.dispatch(this.onState, [
-      MessageType.State,
-      this.#guarantor.latest ?? 0,
-      this.#sparse,
-      this.#packed,
-      this.#keys,
-      this.#versions,
-      entryLock,
-    ])
+    Signal.dispatch(this.onShareState, makeShareStateMessage(this.state))
   }
 
   async #ensureRegistry() {
-    // Acquire a lock on the entire registry
-    await acquireLock(this.#lock)
-    await this.#guarantor.guarantee()
-    if (this.#state[STATE_OFFSET_SIZE] >= this.#state[STATE_OFFSET_GROW_THRESHOLD]) {
+    await Lock.acquireLock(this.#registryLock)
+    await this.#registryVersionGuarantor.guarantee()
+    if (
+      this.#registryState[STATE_OFFSET_SIZE] >=
+      this.#registryState[STATE_OFFSET_GROW_THRESHOLD]
+    ) {
       await this.#grow()
     }
-    releaseLock(this.#lock)
+    Lock.releaseLock(this.#registryLock)
   }
 
   /**
    * Find the offset of an existing key in the registry. Returns -1 if an
    * entry with the provided key does not exist.
    */
-  #locate(key: number) {
-    let length = this.#state[STATE_OFFSET_LENGTH]
+  #locateExistingEntry(key: number) {
+    let length = this.#registryState[STATE_OFFSET_LENGTH]
     let offset = slot(key, length)
     let end = offset + length
     while (offset < end) {
-      let s = offset % length
-      if (this.#keys[s] === key) return s
+      let sparseIndex = offset % length
+      if (this.#keys[sparseIndex] === key) return sparseIndex
       offset++
     }
     return -1
@@ -261,170 +231,197 @@ export class Registry<T> {
    * index is found, `acquire` will immediately acquire a lock on that index.
    * Returns -1 if no available index is found.
    */
-  async #acquire(key: number) {
-    let length = this.#state[STATE_OFFSET_LENGTH]
+  async #locateAndAcquireEntry(key: number) {
+    let length = this.#registryState[STATE_OFFSET_LENGTH]
     let offset = slot(key, length)
     let end = offset + length
     while (offset < end) {
-      let s = offset % length
-      await acquireLock(this.#locks, s)
-      if (this.#keys[s] === key || this.#keys[s] === 0) {
-        return this.#ensureEntry(s)
+      let sparseIndex = offset % length
+      await this.#acquireEntryLock(sparseIndex)
+      if (this.#keys[sparseIndex] === key || this.#keys[sparseIndex] === 0) {
+        return this.#ensureLatestEntryVersion(sparseIndex)
       }
-      releaseLock(this.#locks, s)
+      this.#releaseEntryLock(sparseIndex)
       offset++
     }
     return -1
   }
 
   /**
-   * Ensure this thread has the latest version of an entry. Returns a promise
-   * that resolves only
+   * Return a promise that resolves only once the current thread has the latest
+   * version of an entry.
    */
-  async #ensureEntry(s: number): Promise<number> {
-    await (await this.#getOrMakeGuarantor(s)).guarantee()
-    return s
+  async #ensureLatestEntryVersion(sparseIndex: number): Promise<number> {
+    const guarantor = this.#getOrMakeEntryVersionGuarantor(sparseIndex)
+    await guarantor.guarantee()
+    return sparseIndex
   }
 
-  async #getOrMakeGuarantor(s: number) {
+  #getOrMakeEntryVersionGuarantor(sparseIndex: number) {
     return (
-      this.#guarantors[s] ??
-      (this.#guarantors[s] = new SharedGuarantor(this.#versions, s))
+      this.#entryVersionGuarantors[sparseIndex] ??
+      (this.#entryVersionGuarantors[sparseIndex] = new SharedGuarantor(
+        this.#versions,
+        sparseIndex,
+      ))
     )
   }
 
-  async #set(key: number, s: number, value: T, version?: number) {
-    let guarantor = await this.#getOrMakeGuarantor(s)
-    let p: number
+  async #set(key: number, sparseIndex: number, value: T, version?: number) {
+    let packedIndex: number
     if (version === undefined || version === 0) {
-      p = this.#state[STATE_OFFSET_SIZE]++
-      this.#keys[s] = key
-      this.#packed[p] = s
-      this.#sparse[s] = p
+      packedIndex = this.#registryState[STATE_OFFSET_SIZE]++
+      this.#keys[sparseIndex] = key
+      this.#packed[packedIndex] = sparseIndex
+      this.#sparse[sparseIndex] = packedIndex
     } else {
-      p = this.#sparse[s]
+      packedIndex = this.#sparse[sparseIndex]
     }
-    guarantor.update(++this.#versions[s])
-    this.#values[p] = value
+    this.#values[packedIndex] = value
+  }
+
+  #acquiredEntries: number[] = []
+  async #acquireEntryLock(sparseIndex: number) {
+    if (this.#acquiredEntries[sparseIndex] > 0) {
+      this.#acquiredEntries[sparseIndex]++
+      return
+    }
+    await Lock.acquireLock(this.#locks, sparseIndex)
+    this.#acquiredEntries[sparseIndex] = 1
+  }
+
+  #releaseEntryLock(sparseIndex: number, n = 1) {
+    if ((this.#acquiredEntries[sparseIndex] -= n) <= 0) {
+      Lock.releaseLock(this.#locks, sparseIndex)
+      this.#acquiredEntries[sparseIndex] = 0
+    }
   }
 
   async acquire(key: number) {
-    let s = await this.#acquire(key)
-    if (s === -1) return undefined
-    return this.#values[this.#sparse[s]]
+    let sparseIndex = await this.#locateAndAcquireEntry(key)
+    if (sparseIndex === -1) return undefined
+    return this.#values[this.#sparse[sparseIndex]]
   }
 
   async release(key: number) {
-    let s = await this.#acquire(key)
-    if (s === -1) return false
-    releaseLock(this.#locks, s)
+    let sparseIndex = await this.#locateAndAcquireEntry(key)
+    if (sparseIndex === -1) return false
+    this.#releaseEntryLock(sparseIndex, 2)
     return true
+  }
+
+  async get(key: number) {
+    await this.#ensureRegistry()
+    const sparseIndex = await this.#locateAndAcquireEntry(key)
+    if (sparseIndex === -1) return undefined
+    const value = this.#values[this.#sparse[sparseIndex]]
+    this.#releaseEntryLock(sparseIndex)
+    return value
   }
 
   async set(key: number, value: T) {
     await this.#ensureRegistry()
-    let s = await this.#acquire(key)
-    Debug.assert(s > -1)
-    let version = this.#versions[s]
-    await this.#set(key, s, value, version)
-    releaseLock(this.#locks, s)
-    Signal.dispatch(this.onShare, [
-      0,
-      key,
-      value,
-      (await this.#getOrMakeGuarantor(s)).latest,
-    ])
+    const sparseIndex = await this.#locateAndAcquireEntry(key)
+    const guarantor = this.#getOrMakeEntryVersionGuarantor(sparseIndex)
+    const version = this.#versions[sparseIndex]
+    Debug.assert(sparseIndex > -1)
+    await this.#set(key, sparseIndex, value, version)
+    this.#releaseEntryLock(sparseIndex)
+
+    Signal.dispatch(
+      this.onShareEntry,
+      makeShareEntryMessage(key, value, guarantor.increment()),
+    )
     return this
   }
 
-  async recieve(message: Message) {
+  async receiveMessage(message: Message<T>) {
     switch (message[0]) {
-      case 0: {
+      case MessageType.ShareEntry: {
         const [, key, value, version] = message
-        let s = await this.#acquire(key)
-        Debug.assert(s > -1)
-        let guarantor = await this.#getOrMakeGuarantor(s)
-        let localVersion = guarantor.latest
-        if (localVersion === 0) {
-          await this.#set(key, s, value as T, localVersion)
-        } else if (version > localVersion) {
-          this.#values[this.#sparse[s]] = value as T
-        }
-        guarantor.update(version)
-        releaseLock(this.#locks, s)
+        const sparseIndex = this.#locateExistingEntry(key)
+        await this.#acquireEntryLock(sparseIndex)
+        const guarantor = this.#getOrMakeEntryVersionGuarantor(sparseIndex)
+        this.#values[this.#sparse[sparseIndex]] = value
+        guarantor.load(version)
+        this.#releaseEntryLock(sparseIndex)
         break
       }
-      case 1: {
-        const [, version, sparse, packed, keys, versions, entryLock] = message
+      case MessageType.ShareState: {
+        const [, { sparse, packed, keys, versions, locks, version, state }] = message
+        this.#registryState = state
         this.#sparse = sparse
         this.#packed = packed
         this.#keys = keys
         this.#versions = versions
-        this.#locks = entryLock
-        this.#guarantor.update(version)
+        this.#locks = locks
+        this.#registryVersionGuarantor.load(version)
       }
     }
   }
 
   get size() {
-    return this.#state[STATE_OFFSET_SIZE]
+    return this.#registryState[STATE_OFFSET_SIZE]
   }
 
   async has(key: number) {
-    return this.#locate(key) > 0
+    return this.#locateExistingEntry(key) > 0
   }
 
   async delete(key: number) {
     if (!this.has(key)) return false
-    let s = await this.#acquire(key)
-    let p = this.#sparse[s]
-    let guarantor = await this.#getOrMakeGuarantor(s)
-    guarantor.update(0)
-    this.#sparse[s] = 0
-    this.#packed[p] = 0
-    this.#keys[s] = 0
+    const sparseIndex = await this.#locateAndAcquireEntry(key)
+    const packedIndex = this.#sparse[sparseIndex]
+    const guarantor = this.#getOrMakeEntryVersionGuarantor(sparseIndex)
+    guarantor.load(0)
+    this.#sparse[sparseIndex] = this.#packed[packedIndex] = this.#keys[sparseIndex] = 0
     // @ts-expect-error
-    this.#values[s] = undefined
-    this.#state[STATE_OFFSET_SIZE]--
-    releaseLock(this.#locks, s)
+    this.#values[sparseIndex] = undefined
+    this.#registryState[STATE_OFFSET_SIZE]--
+    this.#releaseEntryLock(sparseIndex)
     return true
   }
 
   async clear() {
     await this.#ensureRegistry()
-    let size = this.#state[STATE_OFFSET_SIZE]
-    let promises: Promise<unknown>[] = []
-    for (let p = 0; p < size; p++) {
-      promises.push(this.delete(this.#sparse[this.#packed[p]]))
+    let size = this.#registryState[STATE_OFFSET_SIZE]
+    let ops: Promise<unknown>[] = []
+    for (let packedIndex = 0; packedIndex < size; packedIndex++) {
+      ops.push(this.delete(this.#sparse[this.#packed[packedIndex]]))
     }
-    await Promise.all(promises)
+    await Promise.all(ops)
   }
 
   forEach(iteratee: ForEachCallback<T>, thisArg?: any) {
-    let size = this.#state[STATE_OFFSET_SIZE]
-    for (let p = 0; p < size; p++) {
-      iteratee.call(thisArg, this.#values[p]!, this.#sparse[this.#packed[p]], this)
+    let size = this.#registryState[STATE_OFFSET_SIZE]
+    for (let packedIndex = 0; packedIndex < size; packedIndex++) {
+      iteratee.call(
+        thisArg,
+        this.#values[packedIndex]!,
+        this.#sparse[this.#packed[packedIndex]],
+        this,
+      )
     }
   }
 
   *entries(): IterableIterator<[number, T]> {
-    let size = this.#state[STATE_OFFSET_SIZE]
-    for (let p = 0; p < size; p++) {
-      yield [this.#sparse[this.#packed[p]], this.#values[p]!]
+    let size = this.#registryState[STATE_OFFSET_SIZE]
+    for (let packedIndex = 0; packedIndex < size; packedIndex++) {
+      yield [this.#sparse[this.#packed[packedIndex]], this.#values[packedIndex]!]
     }
   }
 
   *keys(): IterableIterator<number> {
-    let size = this.#state[STATE_OFFSET_SIZE]
-    for (let p = 0; p < size; p++) {
-      yield this.#sparse[this.#packed[p]]
+    let size = this.#registryState[STATE_OFFSET_SIZE]
+    for (let packedIndex = 0; packedIndex < size; packedIndex++) {
+      yield this.#sparse[this.#packed[packedIndex]]
     }
   }
 
   *values(): IterableIterator<T> {
-    let size = this.#state[STATE_OFFSET_SIZE]
-    for (let p = 0; p < size; p++) {
-      yield this.#values[p]
+    let size = this.#registryState[STATE_OFFSET_SIZE]
+    for (let packedIndex = 0; packedIndex < size; packedIndex++) {
+      yield this.#values[packedIndex]
     }
   }
 
@@ -434,5 +431,17 @@ export class Registry<T> {
 
   get [Symbol.toStringTag]() {
     return "Registry"
+  }
+
+  get state(): State {
+    return {
+      keys: this.#keys,
+      locks: this.#locks,
+      packed: this.#packed,
+      sparse: this.#sparse,
+      state: this.#registryState,
+      version: this.#registryVersionGuarantor.latest ?? 0,
+      versions: this.#versions,
+    }
   }
 }
