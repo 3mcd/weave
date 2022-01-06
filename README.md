@@ -87,4 +87,5 @@ setTimeout(async () => {
 const arr = await map.acquire(1)
 const arrDoubled = doubleTypedArray(arr)
 await map.set(1, arrDoubled)
+map.release(1)
 ```
