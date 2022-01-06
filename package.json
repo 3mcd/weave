@@ -8,7 +8,7 @@
     "build": "tsc",
     "prepare": "npm run build",
     "test": "jest --verbose",
-    "start": "node --loader ts-node/esm --experimental-specifier-resolution=node src/sandbox.ts"
+    "start": "node --loader ts-node/esm --experimental-specifier-resolution=node sandbox.js"
   },
   "author": "",
   "license": "ISC",

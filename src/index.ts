@@ -2,7 +2,7 @@ import "./polyfill"
 import * as Debug from "./debug"
 import { Guarantor } from "./guarantor"
 import * as Lock from "./lock"
-import * as Signal from "./signal"
+import { Signal } from "./signal"
 
 type ForEachCallback<T> = (value: T, key: number, registry: Registry<T>) => void
 
@@ -11,7 +11,7 @@ enum MessageType {
   ShareState,
 }
 
-type State = {
+type SerializedRegistry = {
   state: Uint32Array
   version: number
   sparse: Float64Array
@@ -28,7 +28,7 @@ type ShareEntryMessage<T> = [
   version: number,
 ]
 
-type ShareStateMessage = [type: MessageType.ShareState, state: State]
+type ShareStateMessage = [type: MessageType.ShareState, state: SerializedRegistry]
 
 type Message<T> = ShareEntryMessage<T> | ShareStateMessage
 
@@ -91,7 +91,7 @@ export function makeShareEntryMessage<T>(
   return [MessageType.ShareEntry, key, value, version]
 }
 
-export function makeShareStateMessage(state: State): ShareStateMessage {
+export function makeShareStateMessage(state: SerializedRegistry): ShareStateMessage {
   return [MessageType.ShareState, state]
 }
 
@@ -115,26 +115,31 @@ export class Registry<T> {
   /**
    * Sparse TypedArray of keys.
    */
+  // @ts-ignore
   #keys: Float64Array
 
   /**
    * Sparse TypedArray of entry lock bits.
    */
+  // @ts-ignore
   #locks: Int32Array
 
   /**
    * Dense TypedArray that maps values to their offset in the sparse arrays.
    */
+  // @ts-ignore
   #packed: Float64Array
 
   /**
    * Sparse TypedArray that maps keys to their offset in the packed arrays.
    */
+  // @ts-ignore
   #sparse: Float64Array
 
   /**
    * Sparse TypedArray of entry versions.
    */
+  // @ts-ignore
   #versions: Uint32Array
 
   /**
@@ -151,21 +156,34 @@ export class Registry<T> {
   #loadFactor: number = 0.7
   #growFactor: number = 2
 
-  onShareState = Signal.make<ShareStateMessage>()
-  onShareEntry = Signal.make<ShareEntryMessage<T>>()
+  onMessage = new Signal<Message<T>>()
+  onShareState = new Signal<ShareStateMessage>()
+  onShareEntry = new Signal<ShareEntryMessage<T>>()
 
-  constructor(length = 1000, loadFactor?: number, growFactor?: number) {
-    const { sparse, packed, keys, versions, locks } = makeRegistrySharedArrays(length)
+  constructor(
+    length: number | ShareStateMessage = 1000,
+    loadFactor?: number,
+    growFactor?: number,
+  ) {
     this.#loadFactor = loadFactor ?? this.#loadFactor
     this.#growFactor = growFactor ?? this.#growFactor
-    this.#keys = keys
-    this.#locks = locks
-    this.#packed = packed
-    this.#sparse = sparse
-    this.#versions = versions
-    this.#registryState[STATE_OFFSET_LENGTH] = length
-    this.#registryState[STATE_OFFSET_GROW_THRESHOLD] = length * this.#loadFactor
-    this.#registryState[STATE_OFFSET_GROW_TARGET] = length + length * this.#growFactor
+
+    if (typeof length === "number") {
+      const { sparse, packed, keys, versions, locks } = makeRegistrySharedArrays(length)
+      this.#keys = keys
+      this.#locks = locks
+      this.#packed = packed
+      this.#sparse = sparse
+      this.#versions = versions
+      this.#registryState[STATE_OFFSET_LENGTH] = length
+      this.#registryState[STATE_OFFSET_GROW_THRESHOLD] = length * this.#loadFactor
+      this.#registryState[STATE_OFFSET_GROW_TARGET] = length + length * this.#growFactor
+    } else {
+      this.#handleShareStateMessage(length)
+    }
+
+    this.onShareEntry.subscribe(m => this.onMessage.dispatch(m))
+    this.onShareState.subscribe(m => this.onMessage.dispatch(m))
   }
 
   async #grow() {
@@ -195,7 +213,7 @@ export class Registry<T> {
       Lock.releaseLock(prevLocks, sparseIndex)
     }
 
-    Signal.dispatch(this.onShareState, makeShareStateMessage(this.state))
+    this.onShareState.dispatch(makeShareStateMessage(this.state))
   }
 
   async #ensureRegistry() {
@@ -327,36 +345,37 @@ export class Registry<T> {
     Debug.assert(sparseIndex > -1)
     await this.#set(key, sparseIndex, value, version)
     this.#releaseEntryLock(sparseIndex)
-
-    Signal.dispatch(
-      this.onShareEntry,
-      makeShareEntryMessage(key, value, guarantor.increment()),
-    )
+    this.onShareEntry.dispatch(makeShareEntryMessage(key, value, guarantor.increment()))
     return this
+  }
+
+  async #handleShareEntryMessage(message: ShareEntryMessage<T>) {
+    const [, key, value, version] = message
+    const sparseIndex = this.#locateExistingEntry(key)
+    await this.#acquireEntryLock(sparseIndex)
+    const guarantor = this.#getOrMakeEntryVersionGuarantor(sparseIndex)
+    this.#values[this.#sparse[sparseIndex]] = value
+    guarantor.load(version)
+    this.#releaseEntryLock(sparseIndex)
+  }
+
+  #handleShareStateMessage(message: ShareStateMessage) {
+    const [, { sparse, packed, keys, versions, locks, version, state }] = message
+    this.#registryState = state
+    this.#sparse = sparse
+    this.#packed = packed
+    this.#keys = keys
+    this.#versions = versions
+    this.#locks = locks
+    this.#registryVersionGuarantor.load(version)
   }
 
   async receiveMessage(message: Message<T>) {
     switch (message[0]) {
-      case MessageType.ShareEntry: {
-        const [, key, value, version] = message
-        const sparseIndex = this.#locateExistingEntry(key)
-        await this.#acquireEntryLock(sparseIndex)
-        const guarantor = this.#getOrMakeEntryVersionGuarantor(sparseIndex)
-        this.#values[this.#sparse[sparseIndex]] = value
-        guarantor.load(version)
-        this.#releaseEntryLock(sparseIndex)
-        break
-      }
-      case MessageType.ShareState: {
-        const [, { sparse, packed, keys, versions, locks, version, state }] = message
-        this.#registryState = state
-        this.#sparse = sparse
-        this.#packed = packed
-        this.#keys = keys
-        this.#versions = versions
-        this.#locks = locks
-        this.#registryVersionGuarantor.load(version)
-      }
+      case MessageType.ShareEntry:
+        return await this.#handleShareEntryMessage(message)
+      case MessageType.ShareState:
+        return this.#handleShareStateMessage(message)
     }
   }
 
@@ -369,8 +388,8 @@ export class Registry<T> {
   }
 
   async delete(key: number) {
-    if (!this.has(key)) return false
     const sparseIndex = await this.#locateAndAcquireEntry(key)
+    if (sparseIndex === -1) return false
     const packedIndex = this.#sparse[sparseIndex]
     const guarantor = this.#getOrMakeEntryVersionGuarantor(sparseIndex)
     guarantor.load(0)
@@ -433,7 +452,7 @@ export class Registry<T> {
     return "Registry"
   }
 
-  get state(): State {
+  get state(): SerializedRegistry {
     return {
       keys: this.#keys,
       locks: this.#locks,
@@ -443,5 +462,9 @@ export class Registry<T> {
       version: this.#registryVersionGuarantor.latest ?? 0,
       versions: this.#versions,
     }
+  }
+
+  init(): ShareStateMessage {
+    return makeShareStateMessage(this.state)
   }
 }
