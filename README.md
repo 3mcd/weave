@@ -9,6 +9,8 @@ It's intended to be used to share `SharedArrayBuffer` instances between multiple
 - lock read/write operations of an entry to a single thread
 - transfer new copies of objects (like `SharedArrayBuffers`, but any `postMessage`-transferable object will work) to other threads
 
+Eventually **this strategy will be invalidated** by https://github.com/tc39/proposal-resizablearraybuffer, which should provide the means to resize SharedArrayBuffer instances in-place.
+
 ### Example
 
 ```ts
